@@ -3,16 +3,21 @@ from flask import Flask,render_template,request,url_for, session,redirect,Respon
 import pymongo,datetime
 from werkzeug.wrappers import Request
 from passlib.hash import sha256_crypt
-import json,urlparse
+import json,urlparse,random,string
 from flask.sessions import SecureCookieSessionInterface
 import json
 from bson.objectid import ObjectId
 from ws4py.server.geventserver import WebSocketWSGIApplication, WSGIServer
+from gevent import queue
+import gevent
 from ws4py.websocket import EchoWebSocket
 import config
+import redis
 
 conn = pymongo.MongoClient(config.MONGO_PATH)
 db = conn["mchat"]
+
+red = redis.StrictRedis(host="localhost",port=6379,db=0)
 
 app = Flask(__name__)
 app.secret_key = "70hn637p1iLalKE68ZuYicg9vsf5K3R4"
@@ -61,23 +66,67 @@ def login():
 def logout():
 	session.pop('username', None)
 	return redirect(url_for('login'))
-	
+
+@app.route("/api/login",methods=["POST"])
+def api_login():
+	if not "username" in request.form or not "pw" in request.form:
+		abort(400)
+	user = db.users.find_one({"username":request.form["username"]},fields=["pw"]) 
+	if user == None or not sha256_crypt.verify(request.form["pw"],user["pw"]):
+		abort(403)
+	secret = ''.join(random.choice(string.ascii_letters+string.digits) for x in range(16))
+	red.set(secret,"",ex=3600*12)
+	return secret
+
 @app.route("/api/send",methods=["POST"])
 def send():
-	if not "username" in session or not session["username"] == "admin":
+	if not "secret" in request.form or red.get(request.form["secret"])==None:
 		abort(403)
 	if not "author" in request.form or not "content" in request.form:
 		abort(400)
 	msg = {"content":str(request.form["content"]),"time":datetime.datetime.now(),
-			"author":str(request.form["author"])}
+			"author":str(request.form["author"]),"type":"msg"}
 
 	request.environ["chat.app"].sendToAll(msg)
-	return {}
+	return "success"
 
-@app.route("/api/get")
-def get():
-	if not "username" in session or not session["username"] == "admin":
+def chat_poller(body,i):
+	client = red.pubsub()
+	#First return messages from db
+	for msg in get_newer_than(i):
+		s = (json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
+		print "DB:",s
+		body.put(s)
+	#Then subscribe to the channel
+	client.subscribe("chat")
+	chat = client.listen()
+	for msg in chat:
+		print "Channel:",msg
+		body.put(msg)
+
+#Long Polling
+@app.route("/api/get",methods=["POST"])
+def get(request):
+	if not "secret" in request.form or red.get(request.form["secret"])==None:
 		abort(403)
+
+	if not "operation" in request.form:
+		abort(400)
+
+	if request.form["operation"] == "newer_than":
+		#Initial GET/Get newest entrys
+		if not "_id" in request.form:
+			msgs = get_newest()
+			resp = ""
+			for msg in msgs:
+				resp+=(json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
+			return resp
+		else:
+			body = queue.Queue()
+			gevent.spawn(chat_poller,body,request.form["_id"])
+			return body
+	else:
+		abort(400)
 
 
 @app.route("/")
@@ -140,6 +189,9 @@ class Application(object):
 			environ["chat.req"] = req
 			environ["chat.sess"] = sess
 			self.ws(environ,start_response)
+		elif path=="/api/get":
+			print "Directyl calling get"
+			return get(req)
 		else:
 			return app(environ,start_response)
 
@@ -149,7 +201,9 @@ class Application(object):
 		s = json.dumps(msg,cls=CustomEncoder)
 		for socket in self.clients:
 			socket.send(s)
+			red.publish("chat",s.replace("\n","")+"\n")
 
 if __name__ == "__main__":
+	app.debug = True
 	server = WSGIServer(("0.0.0.0", 8080), Application())
 	server.serve_forever()
