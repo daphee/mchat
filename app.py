@@ -9,8 +9,9 @@ import json
 from bson.objectid import ObjectId
 from ws4py.server.geventserver import WebSocketWSGIApplication, WSGIServer
 from ws4py.websocket import EchoWebSocket
+import config
 
-conn = pymongo.MongoClient("mongodb://localhost")
+conn = pymongo.MongoClient(config.MONGO_PATH)
 db = conn["mchat"]
 
 app = Flask(__name__)
