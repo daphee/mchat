@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+    <head>
+        <title>MCHAT 0.1 beta</title>
+    </head>
+    <body>
+        <form class="login-form" action="/login" method="POST">
+                <h2>Bitte anmelden</h2>
+                <div class="form-group has-error">
+                <div class="form-group">
+                    <label class="control-label" for="username">Benutzername</label>
+                    <input name="username" id="username" class="form-control" type="text" autofocus>
+                </div>
+                <div>
+                    <label class="control-label" for="pw">Passwort</label>
+                    <input name="pw" id="username" class="form-control" type="password">
+                </div>
+                <button class="btn btn-primary btn-block" type="submit">Login</button>
+            </form>
+            {% if error %}
+                <div class="alert alert-danger">{{ errormsg|safe }}</div>
+            {% endif %}
+    </body>
+</html>
