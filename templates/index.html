@@ -15,9 +15,9 @@
         </script>
         <p>Logged in as {{username}}</p>
         <div id="messages">
-            {% for entry in entrys %}
+            {#{% for entry in entrys %}
             <p><i>{{entry["time"].strftime("%X %x")}}</i><b>{{entry["nick"]}}</b>{{entry["content"]}}</p>
-            {% endfor %}
+            {% endfor %}#}
         </div>
         <textarea rows=4 style="width:100%"></textarea>
     </body>

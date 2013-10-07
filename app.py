@@ -6,6 +6,7 @@ from passlib.hash import sha256_crypt
 import json,urlparse
 from flask.sessions import SecureCookieSessionInterface
 import json
+from bson.objectid import ObjectId
 from ws4py.server.geventserver import WebSocketWSGIApplication, WSGIServer
 from ws4py.websocket import EchoWebSocket
 
@@ -14,6 +15,34 @@ db = conn["mchat"]
 
 app = Flask(__name__)
 app.secret_key = "70hn637p1iLalKE68ZuYicg9vsf5K3R4"
+
+NUM_MESSAGES = 50
+
+class CustomEncoder(json.JSONEncoder):
+	def default(self, obj):
+		if isinstance(obj, ObjectId):
+			return str(obj)
+		else:
+			return super(CustomEncoder, self).default(obj)
+
+def get_newest(limit=NUM_MESSAGES):
+	#Limit 'limit' elements. We sort descending because we want 'limit' from newest to oldest. 
+	#Nevertheless JS processes oldest to newest. So we reverse in Python
+	msgs = []
+	for msg in db.messages.find().sort("time",direction=pymongo.DESCENDING).limit(limit):
+		msg["time"] = msg["time"].strftime("%X %x")
+		msgs.append(msg)
+	msgs.reverse()
+ 	return msgs
+
+#Expects string id
+def get_newer_than(i):
+	msgs = []
+	for msg in db.messages.find({"_id":{"$gt":ObjectId(i)}}):
+		msg["time"] = msg["time"].strftime("%X %x")
+		msgs.append(msg)
+	return msgs
+
 
 @app.route("/login",methods=["GET","POST"])
 def login():
@@ -38,7 +67,7 @@ def send():
 		abort(403)
 	if not "author" in request.form or not "content" in request.form:
 		abort(400)
-	msg = {"content":str(request.form["content"]),"time":datetime.datetime.now().strftime("%X %x"),
+	msg = {"content":str(request.form["content"]),"time":datetime.datetime.now(),
 			"author":str(request.form["author"])}
 
 	request.environ["chat.app"].sendToAll(msg)
@@ -50,13 +79,11 @@ def get():
 		abort(403)
 
 
-
 @app.route("/")
 def index():
     if not "username" in session:
         return redirect(url_for("login"))
-    entries = db.messages.find(sort=[("time",1)],limit=300)
-    return render_template("index.html",entries=entries,username=session["username"])
+    return render_template("index.html",username=session["username"])
 
 class ChatWebSocket(EchoWebSocket):
 	def opened(self):
@@ -65,13 +92,27 @@ class ChatWebSocket(EchoWebSocket):
 
 	def received_message(self, m):
 		app = self.environ['chat.app']
-		msg = {"content":str(m),"time":datetime.datetime.now(),
-			"author":str(self.environ["chat.sess"]["username"])}
-		db.messages.insert(msg)
-		del msg["_id"]
-		msg["time"] = msg["time"].strftime("%X %x")
-		s = json.dumps(msg)
-		app.sendToAll(s)
+		packet = json.loads(str(m))
+		print "Got",packet
+		#A Chat message was received
+		if packet["type"] == "send":
+			msg = {"content":packet["msg"],"time":datetime.datetime.now(),
+				"author":self.environ["chat.sess"]["username"],"type":"msg"}
+			app.sendToAll(msg)
+		#Client wants something different
+		elif packet["type"] == "request":
+			#Sync or initial load
+			if packet["operation"] == "newer_than":
+				resp = {"type":"response","operation":"newer_than"}
+				#INitial load
+				if packet["_id"] == "0":
+					resp["response_data"] = get_newest()
+				#Sync
+				else:
+					resp["response_data"] = get_newer_than(packet["_id"])
+				self.send(json.dumps(resp,cls=CustomEncoder))
+
+
 
 	def closed(self, code, reason):
 		app = self.environ.pop('chat.app')
@@ -101,19 +142,15 @@ class Application(object):
 		else:
 			return app(environ,start_response)
 
-	def sendToAll(self,s):
+	def sendToAll(self,msg):
+		db.messages.insert(msg)
+		msg["time"] = msg["time"].strftime("%X %x")
+		s = json.dumps(msg,cls=CustomEncoder)
 		for socket in self.clients:
 			socket.send(s)
 
 
 
 if __name__ == "__main__":
-	app.debug = True
-	
-	"""server = make_server('', 8080, server_class=WSGIServer,
-                     handler_class=WebSocketWSGIRequestHandler,
-                     app=my_app)
-	server.initialize_websockets_manager()
-	server.serve_forever()"""
 	server = WSGIServer(("0.0.0.0", 8080), Application())
 	server.serve_forever()
