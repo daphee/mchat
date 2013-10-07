@@ -149,8 +149,6 @@ class Application(object):
 		for socket in self.clients:
 			socket.send(s)
 
-
-
 if __name__ == "__main__":
 	server = WSGIServer(("0.0.0.0", 8080), Application())
 	server.serve_forever()
