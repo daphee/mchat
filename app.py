@@ -9,12 +9,13 @@ import json,urlparse,random,string
 from flask.sessions import SecureCookieSessionInterface
 import json
 from bson.objectid import ObjectId
-from ws4py.server.geventserver import WebSocketWSGIApplication, WSGIServer
+from ws4py.server.geventserver import WebSocketWSGIApplication,WSGIServer
 from gevent import queue,Timeout
 import gevent
+from gevent.event import Event
 from ws4py.websocket import EchoWebSocket
 import config
-import redis
+import redis,time
 
 conn = config.get_mongo()
 db = conn["mchat"]
@@ -26,6 +27,7 @@ app.secret_key = config.secret_key
 
 NUM_MESSAGES = 50
 
+#Encode ObjectIDs
 class CustomEncoder(json.JSONEncoder):
 	def default(self, obj):
 		if isinstance(obj, ObjectId):
@@ -33,6 +35,7 @@ class CustomEncoder(json.JSONEncoder):
 		else:
 			return super(CustomEncoder, self).default(obj)
 
+#Get newest messages
 def get_newest(limit=NUM_MESSAGES):
 	#Limit 'limit' elements. We sort descending because we want 'limit' from newest to oldest. 
 	#Nevertheless JS processes oldest to newest. So we reverse in Python
@@ -43,6 +46,7 @@ def get_newest(limit=NUM_MESSAGES):
 	msgs.reverse()
  	return msgs
 
+#Get messages newer than id ($natural order)
 #Expects string id
 def get_newer_than(i):
 	msgs = []
@@ -95,27 +99,59 @@ def send():
 class TimeoutException(Exception):
     pass
 
+#Working!!!! Can return ms per request
+"""
 def chat_poller(q,i):
-    #msgs = []
-    #Break request after 60 seconds
-    t = Timeout(60,TimeoutException)
-    t.start()
-    try:
-	    #First return messages from db
-	    for msg in get_newer_than(i):
-	    	s = (json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
-            q.put(s)
-	    #Then subscribe to the channel
-	    client = red.pubsub()
-	    client.subscribe("chat")
-	    chat = client.listen()
-	    for msg in chat:
-	        q.put(msg)
-    except TimeoutException:
-        q.put(StopIteration)
-        
+	#Break request after 60 seconds
+	t = Timeout(60,TimeoutException)
+	t.start()
+	try:
+		#First return messages from db
+		for msg in get_newer_than(i):
+			s = (json.dumps(msg,cls=CustomEncoder).replace("\n"," ")+"\n")
+			q.put(s)
+		#Then subscribe to the channel
+		client = red.pubsub()
+		client.subscribe("chat")
+		chat = client.listen()
+		for msg in chat:
+			if msg["type"] == "message":
+				s = (msg["data"].replace("\n"," ")+"\n")
+				q.put(s)
+	except TimeoutException:
+		q.put(StopIteration)
+		print "Timeout"
 
-#Long Polling
+def get(environ,start_response):
+	request = environ["chat.req"]
+	if not "secret" in request.form or red.get(request.form["secret"])==None:
+		abort(403)
+
+	if not "operation" in request.form:
+		abort(400)
+	headers = [
+		("Content-Type","application/json")
+	]
+
+	if request.form["operation"] == "newer_than":
+		#Initial GET/Get newest entrys
+		if not "_id" in request.form or request.form["_id"] == "0":
+			msgs = get_newest()
+			resp = ""
+			for msg in msgs:
+				resp+=(json.dumps(msg,cls=CustomEncoder).replace("\n"," ")+"\n")
+			start_response("200 OK",headers)
+			return resp
+		else:
+			q = queue.Queue()
+			#headers.append(("Transfer-Encoding","chunked"))
+			start_response("200 OK",headers)
+			gevent.spawn(chat_poller,q,request.form["_id"])
+			return q
+	else:
+		abort(400)
+"""
+
 @app.route("/api/get",methods=["POST"])
 def get():
 	if not "secret" in request.form or red.get(request.form["secret"])==None:
@@ -125,20 +161,31 @@ def get():
 		abort(400)
 
 	if request.form["operation"] == "newer_than":
-		#Initial GET/Get newest entrys
+		msgs = []
 		if not "_id" in request.form or request.form["_id"] == "0":
-			msgs = get_newest()
-			resp = ""
-			for msg in msgs:
-				resp+=(json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
-			return resp
+			if "limit" in request.form and request.form["limit"].isdigit():
+				msgs = get_newest(int(request.form["limit"]))
+			else:
+				msgs = get_newest()
 		else:
-		    q = queue.Queue()
-		    gevent.spawn(chat_poller,q,request.form["_id"])
-		    return q
+			msgs = get_newer_than(request.form["_id"])
+
+		#If there were no messages wait till we get the first/newest over the redis channel
+		if len(msgs) == 0:
+			client = red.pubsub()
+			client.subscribe("chat")
+			chat = client.listen()
+			#For loop only to filter the subscribe-notification
+			for msg in chat:
+				if msg["type"] == "message":
+					return "["+msg["data"]+"]"
+
+		return json.dumps(msgs,cls=CustomEncoder)
 	else:
 		abort(400)
-
+@app.route("/api/time")
+def api_time():
+	return str(int(time.time()))
 
 @app.route("/")
 def index():
@@ -200,6 +247,9 @@ class Application(object):
 			environ["chat.req"] = req
 			environ["chat.sess"] = sess
 			self.ws(environ,start_response)
+		#elif path == "/api/get":
+		#	environ["chat.req"] = req
+		#	return get(environ,start_response)
 		else:
 			return app(environ,start_response)
 
@@ -209,7 +259,7 @@ class Application(object):
 		s = json.dumps(msg,cls=CustomEncoder)
 		for socket in self.clients:
 			socket.send(s)
-			red.publish("chat",s.replace("\n","")+"\n")
+			red.publish("chat",s)
 
 if __name__ == "__main__":
 	app.debug = True
