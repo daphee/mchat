@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*- 
+from gevent import monkey
+monkey.patch_all()
 from flask import Flask,render_template,request,url_for, session,redirect,Response,abort
 import pymongo,datetime
 from werkzeug.wrappers import Request
@@ -8,19 +10,19 @@ from flask.sessions import SecureCookieSessionInterface
 import json
 from bson.objectid import ObjectId
 from ws4py.server.geventserver import WebSocketWSGIApplication, WSGIServer
-from gevent import queue
+from gevent import queue,Timeout
 import gevent
 from ws4py.websocket import EchoWebSocket
 import config
 import redis
 
-conn = pymongo.MongoClient(config.MONGO_PATH)
+conn = config.get_mongo()
 db = conn["mchat"]
 
-red = redis.StrictRedis(host="localhost",port=6379,db=0)
+red = config.get_red()
 
 app = Flask(__name__)
-app.secret_key = "70hn637p1iLalKE68ZuYicg9vsf5K3R4"
+app.secret_key = config.secret_key
 
 NUM_MESSAGES = 50
 
@@ -75,7 +77,7 @@ def api_login():
 	if user == None or not sha256_crypt.verify(request.form["pw"],user["pw"]):
 		abort(403)
 	secret = ''.join(random.choice(string.ascii_letters+string.digits) for x in range(16))
-	red.set(secret,"",ex=3600*12)
+	red.set(secret,True,ex=3600*12)
 	return secret
 
 @app.route("/api/send",methods=["POST"])
@@ -90,23 +92,32 @@ def send():
 	request.environ["chat.app"].sendToAll(msg)
 	return "success"
 
-def chat_poller(body,i):
-	client = red.pubsub()
-	#First return messages from db
-	for msg in get_newer_than(i):
-		s = (json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
-		print "DB:",s
-		body.put(s)
-	#Then subscribe to the channel
-	client.subscribe("chat")
-	chat = client.listen()
-	for msg in chat:
-		print "Channel:",msg
-		body.put(msg)
+class TimeoutException(Exception):
+    pass
+
+def chat_poller(q,i):
+    #msgs = []
+    #Break request after 60 seconds
+    t = Timeout(60,TimeoutException)
+    t.start()
+    try:
+	    #First return messages from db
+	    for msg in get_newer_than(i):
+	    	s = (json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
+            q.put(s)
+	    #Then subscribe to the channel
+	    client = red.pubsub()
+	    client.subscribe("chat")
+	    chat = client.listen()
+	    for msg in chat:
+	        q.put(msg)
+    except TimeoutException:
+        q.put(StopIteration)
+        
 
 #Long Polling
 @app.route("/api/get",methods=["POST"])
-def get(request):
+def get():
 	if not "secret" in request.form or red.get(request.form["secret"])==None:
 		abort(403)
 
@@ -115,16 +126,16 @@ def get(request):
 
 	if request.form["operation"] == "newer_than":
 		#Initial GET/Get newest entrys
-		if not "_id" in request.form:
+		if not "_id" in request.form or request.form["_id"] == "0":
 			msgs = get_newest()
 			resp = ""
 			for msg in msgs:
 				resp+=(json.dumps(msg,cls=CustomEncoder).replace("\n","")+"\n")
 			return resp
 		else:
-			body = queue.Queue()
-			gevent.spawn(chat_poller,body,request.form["_id"])
-			return body
+		    q = queue.Queue()
+		    gevent.spawn(chat_poller,q,request.form["_id"])
+		    return q
 	else:
 		abort(400)
 
@@ -189,9 +200,6 @@ class Application(object):
 			environ["chat.req"] = req
 			environ["chat.sess"] = sess
 			self.ws(environ,start_response)
-		elif path=="/api/get":
-			print "Directyl calling get"
-			return get(req)
 		else:
 			return app(environ,start_response)
 
